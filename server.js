@@ -84,8 +84,19 @@ async function saveToGitHub() {
 // ============ Socket Management ============
 async function createSocket(fresh = false) {
   const b = await getBaileys();
-  const { default: makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, Browsers } = b;
+  // Handle different ESM export structures
+  const makeWASocket = b.default || b.makeWASocket;
+  const useMultiFileAuthState = b.useMultiFileAuthState;
+  const fetchLatestBaileysVersion = b.fetchLatestBaileysVersion;
+  const Browsers = b.Browsers;
+
+  if (!makeWASocket) {
+    console.error('Baileys exports:', Object.keys(b));
+    throw new Error('makeWASocket not found in baileys exports. Keys: ' + Object.keys(b).join(', '));
+  }
+
   const pinoMod = await import('pino');
+  const pino = pinoMod.default || pinoMod;
 
   if (fresh) { try { fs.rmSync(SESSION_DIR, { recursive: true, force: true }); } catch {} fs.mkdirSync(SESSION_DIR, { recursive: true }); }
 
@@ -94,7 +105,7 @@ async function createSocket(fresh = false) {
   try { version = (await fetchLatestBaileysVersion()).version; } catch { version = [2, 3000, 1021221121]; }
 
   sock = makeWASocket({
-    version, logger: pinoMod.default({ level: 'silent' }), auth: state,
+    version, logger: pino({ level: 'silent' }), auth: state,
     browser: (Browsers?.ubuntu) ? Browsers.ubuntu('ZAID BWP') : ['ZAID BWP', 'Chrome', '1.0.0'],
     printQRInTerminal: false
   });
