@@ -140,7 +140,7 @@ async function createSocket(fresh = false) {
 
   const { state, saveCreds } = await _useMultiFileAuthState(SESSION_DIR);
   let version;
-  try { version = (await _fetchLatestBaileysVersion()).version; } catch { version = [2, 3000, 1021221121]; }
+  try { version = (await _fetchLatestBaileysVersion()).version; console.log('Latest baileys version:', version); } catch { version = [2, 3000, 1021221121]; console.log('Using fallback version:', version); }
 
   const browser = (_Browsers?.ubuntu) ? _Browsers.ubuntu('ZAID BWP') : ['ZAID BWP', 'Chrome', '1.0.0'];
   const logger = _pino({ level: 'silent' });
@@ -150,7 +150,7 @@ async function createSocket(fresh = false) {
 
   sock.ev.on('creds.update', saveCreds);
   sock.ev.on('connection.update', (update) => {
-    const { connection } = update;
+    const { connection, lastDisconnect } = update;
     if (connection === 'open') {
       waConnected = true;
       linkedPhone = sock.user?.id?.split(':')[0] || linkedPhone;
@@ -158,7 +158,19 @@ async function createSocket(fresh = false) {
       if (!linkedAt) linkedAt = new Date().toISOString();
       writeJSON('config.json', { linked: true, phone: linkedPhone, sessionId, linkedAt });
     }
-    if (connection === 'close') { waConnected = false; console.log('WhatsApp disconnected'); }
+    if (connection === 'close') {
+      waConnected = false;
+      const err = lastDisconnect?.error;
+      const statusCode = err?.output?.statusCode || err?.data?.statusCode || 0;
+      console.log('WhatsApp disconnected, statusCode:', statusCode, 'error:', err?.message || 'unknown');
+      // Auto-reconnect if it's a recoverable disconnect (not logged out)
+      if (statusCode !== 401 && statusCode !== 403 && fs.existsSync(path.join(SESSION_DIR, 'creds.json'))) {
+        console.log('Reconnecting...');
+        setTimeout(() => {
+          createSocket(false).catch(e => console.log('Reconnect failed:', e.message));
+        }, 3000);
+      }
+    }
   });
 
   return { sock, state, saveCreds };
@@ -223,8 +235,21 @@ app.post('/api/whatsapp', auth, async (req, res) => {
 
     const result = await new Promise((resolve) => {
       let done = false;
+      let closeCount = 0;
       s.ev.on('connection.update', async (u) => {
-        if (u.connection === 'open' && !done) {
+        const { connection, lastDisconnect } = u;
+        if (connection === 'close') {
+          closeCount++;
+          const err = lastDisconnect?.error;
+          const statusCode = err?.output?.statusCode || err?.data?.statusCode || 0;
+          console.log(`Pairing close #${closeCount}, statusCode: ${statusCode}, msg: ${err?.message || 'unknown'}`);
+          // Only give up after multiple closes or auth failure
+          if (closeCount >= 5 || statusCode === 401 || statusCode === 403) {
+            if (!done) { done = true; resolve({ status: 'error', message: `Connection closed (${statusCode || 'unknown'}). Please try again.` }); }
+          }
+          // Otherwise baileys will auto-reconnect
+        }
+        if (connection === 'open' && !done) {
           done = true;
           const ph = s.user?.id?.split(':')[0] || clean;
           linkedPhone = ph; sessionId = 'zaidashiq_' + crypto.randomBytes(8).toString('hex');
@@ -249,7 +274,6 @@ app.post('/api/whatsapp', auth, async (req, res) => {
           writeJSON('config.json', { linked: true, phone: ph, sessionId, linkedAt });
           resolve({ status: 'linked', phone: ph, sessionId });
         }
-        if (u.connection === 'close' && !done) { done = true; resolve({ status: 'error', message: 'Connection closed. Try again.' }); }
       });
       setTimeout(() => { if (!done) { done = true; resolve({ status: 'timeout', message: 'Timed out (55s). Code not entered in WhatsApp.' }); } }, 55000);
     });
