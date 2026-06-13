@@ -20,7 +20,9 @@ let waConnected = false;
 let linkedPhone = null;
 let sessionId = null;
 let linkedAt = null;
-let pairingListeners = []; // for pairing flow
+let pairingListeners = [];
+let autoReconnect = true; // flag to control auto-reconnect
+let socketId = 0; // track socket instances to prevent stale listeners
 
 // ==================== BAILEYS LOADER ====================
 let _makeWASocket, _useMultiFileAuthState, _fetchLatestBaileysVersion, _Browsers, _pino;
@@ -100,47 +102,61 @@ async function createSocket(fresh = false) {
   try {
     const vl = await _fetchLatestBaileysVersion();
     version = vl.version;
-    console.log('[SOCK] Latest baileys version:', version, 'isLatest:', vl.isLatest);
+    console.log('[SOCK] Latest baileys version:', version);
   } catch (e) {
     version = [2, 3000, 1021221121];
-    console.log('[SOCK] Version fetch failed, using fallback:', version, 'error:', e.message);
+    console.log('[SOCK] Version fetch failed, using fallback');
   }
   const browser = (_Browsers?.ubuntu) ? _Browsers.ubuntu('ZAID BWP') : ['ZAID BWP', 'Chrome', '1.0.0'];
+  const myId = ++socketId;
 
-  console.log('[SOCK] Creating socket, version:', version);
-  // Use 'warn' level so we see Baileys internal errors
+  console.log(`[SOCK#${myId}] Creating socket, version:`, version);
   const logger = _pino({ level: process.env.BAILEYS_LOG || 'warn' });
-  sock = _makeWASocket({ version, logger, auth: state, browser, printQRInTerminal: false, generateHighQualityLinkPreview: false });
+  const newSock = _makeWASocket({ version, logger, auth: state, browser, printQRInTerminal: false, generateHighQualityLinkPreview: false });
+  sock = newSock;
 
-  sock.ev.on('creds.update', saveCreds);
-  sock.ev.on('connection.update', (update) => {
-    const { connection, lastDisconnect, receivedPendingNotifications, isOnline } = update;
-    console.log('[SOCK] update:', JSON.stringify({ connection, isOnline, receivedPendingNotifications, lastDisconnect: lastDisconnect ? { statusCode: lastDisconnect.error?.output?.statusCode, msg: lastDisconnect.error?.message } : null }));
+  newSock.ev.on('creds.update', saveCreds);
+  newSock.ev.on('connection.update', (update) => {
+    // Ignore events from stale sockets
+    if (myId !== socketId) return;
+    const { connection, lastDisconnect } = update;
+    const err = lastDisconnect?.error;
+    const sc = err?.output?.statusCode || err?.data?.statusCode || 0;
+    const errMsg = err?.message || '';
 
+    if (connection === 'connecting') {
+      console.log(`[SOCK#${myId}] Connecting...`);
+    }
     if (connection === 'open') {
       waConnected = true;
-      linkedPhone = sock.user?.id?.split(':')[0] || linkedPhone;
-      console.log('[SOCK] ✅ Connected:', linkedPhone);
+      linkedPhone = newSock.user?.id?.split(':')[0] || linkedPhone;
+      console.log(`[SOCK#${myId}] ✅ Connected:`, linkedPhone);
       if (!linkedAt) linkedAt = new Date().toISOString();
       writeJSON('config.json', { linked: true, phone: linkedPhone, sessionId, linkedAt });
       pairingListeners.forEach(fn => fn({ type: 'open' }));
     }
-
     if (connection === 'close') {
       waConnected = false;
-      const err = lastDisconnect?.error;
-      const sc = err?.output?.statusCode || err?.data?.statusCode || 0;
-      console.log('[SOCK] ❌ Closed, status:', sc, 'msg:', err?.message || 'unknown', 'stack:', err?.stack?.split('\n').slice(0,3).join(' | '));
-      pairingListeners.forEach(fn => fn({ type: 'close', statusCode: sc, error: err?.message }));
-      // Auto-reconnect if not auth failure
-      if (sc !== 401 && sc !== 403 && fs.existsSync(path.join(SESSION_DIR, 'creds.json'))) {
-        console.log('[SOCK] Reconnecting in 3s...');
-        setTimeout(() => createSocket(false).catch(e => console.log('[SOCK] Reconnect failed:', e.message)), 3000);
+      console.log(`[SOCK#${myId}] ❌ Closed, status: ${sc}, msg: ${errMsg}`);
+      pairingListeners.forEach(fn => fn({ type: 'close', statusCode: sc, error: errMsg }));
+      // Auto-reconnect only if:
+      // - autoReconnect is enabled
+      // - not auth failure (401/403)
+      // - not intentional close (re-pair/unlink)
+      // - session exists
+      const intentional = errMsg.includes('re-pair') || errMsg.includes('unlink');
+      if (autoReconnect && !intentional && sc !== 401 && sc !== 403 && fs.existsSync(path.join(SESSION_DIR, 'creds.json'))) {
+        console.log(`[SOCK#${myId}] Reconnecting in 3s...`);
+        setTimeout(() => {
+          if (myId === socketId && autoReconnect) {
+            createSocket(false).catch(e => console.log('[SOCK] Reconnect failed:', e.message));
+          }
+        }, 3000);
       }
     }
   });
 
-  return { sock, state, saveCreds };
+  return { sock: newSock, state, saveCreds };
 }
 
 async function ensureConnected() {
@@ -292,13 +308,15 @@ app.post('/api/pair', async (req, res) => {
     return res.status(400).json({ error: 'Valid phone required. e.g. 923001234567' });
   const clean = phone.replace(/\D/g, '');
   try {
+    // Disable auto-reconnect during pairing to prevent socket conflicts
+    autoReconnect = false;
     if (sock) try { sock.end(new Error('re-pair')); } catch {}
     waConnected = false;
     pairingListeners = [];
     const { sock: s, state, saveCreds } = await createSocket(true);
 
     // For fresh sockets, 'open' only fires AFTER pairing.
-    // We need to request pairing code right away (after brief WS setup).
+    // Wait briefly for WebSocket to establish.
     console.log('[PAIR] Fresh socket created, waiting 3s for WS to stabilize...');
     await new Promise(r => setTimeout(r, 3000));
 
@@ -330,6 +348,7 @@ app.post('/api/pair', async (req, res) => {
         sessionId = 'zaidashiq_' + crypto.randomBytes(8).toString('hex');
         linkedAt = new Date().toISOString();
         waConnected = true;
+        autoReconnect = true; // Re-enable auto-reconnect after successful pairing
         try { saveCreds(); } catch {}
         try { writeJSON('wa-auth-backup.json', { creds: state.creds, keys: serializeKeys(state.keys), phone: ph, sessionId, linkedAt }); saveToGitHub(); } catch {}
         writeJSON('config.json', { linked: true, phone: ph, sessionId, linkedAt });
@@ -347,11 +366,16 @@ app.post('/api/pair', async (req, res) => {
       if (evt.type === 'close') {
         closeCount++;
         console.log(`[PAIR] Close #${closeCount}, status: ${evt.statusCode}`);
+        // After many closes, give up and re-enable auto-reconnect for session restore
+        if (closeCount >= 5) {
+          autoReconnect = true;
+          pairingListeners = [];
+        }
       }
     };
     pairingListeners.push(waiter);
-    // Clean up after 60s
-    setTimeout(() => { pairingListeners = pairingListeners.filter(f => f !== waiter); }, 60000);
+    // Clean up after 90s and re-enable auto-reconnect
+    setTimeout(() => { autoReconnect = true; pairingListeners = pairingListeners.filter(f => f !== waiter); }, 90000);
   } catch (err) {
     console.error('[PAIR] Error:', err);
     res.status(500).json({ error: err.message });
@@ -360,6 +384,7 @@ app.post('/api/pair', async (req, res) => {
 
 app.delete('/api/unlink', async (req, res) => {
   try {
+    autoReconnect = false;
     if (sock) try { sock.end(new Error('unlink')); } catch {}
     sock = null; waConnected = false; linkedPhone = null; sessionId = null; linkedAt = null;
     try { fs.rmSync(SESSION_DIR, { recursive: true, force: true }); } catch {}
