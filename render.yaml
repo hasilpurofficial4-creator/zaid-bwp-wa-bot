@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: zaid-bwp-wa-bot
+    runtime: node
+    buildCommand: cd whatsapp-bot && npm install
+    startCommand: cd whatsapp-bot && node server.js
+    plan: free
+    envVars:
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: JWT_SECRET
+        sync: false
+      - key: WA_SESSION_ID
+        sync: false
+      - key: GITHUB_TOKEN
+        sync: false
+      - key: GITHUB_REPO
+        sync: false
+      - key: PORT
+        value: "3000"
