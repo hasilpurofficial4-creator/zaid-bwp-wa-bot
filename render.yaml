@@ -2,8 +2,8 @@ services:
   - type: web
     name: zaid-bwp-wa-bot
     runtime: node
-    buildCommand: cd whatsapp-bot && npm install
-    startCommand: cd whatsapp-bot && node server.js
+    buildCommand: npm install
+    startCommand: node server.js
     plan: free
     envVars:
       - key: ADMIN_PASSWORD

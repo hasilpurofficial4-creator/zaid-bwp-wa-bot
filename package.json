@@ -1,7 +1,7 @@
 {
-  "name": "zaid-bwp-whatsapp-bot",
-  "version": "1.0.0",
-  "description": "WhatsApp Bot Backend for ZAID BWP Stock Manager - Persistent Baileys connection on Render",
+  "name": "zaid-bwp-wa-bot",
+  "version": "2.0.0",
+  "description": "WhatsApp Bot Backend for ZAID BWP Stock Manager",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
@@ -11,8 +11,7 @@
     "cors": "^2.8.5",
     "express": "^4.21.0",
     "jsonwebtoken": "^9.0.2",
-    "pino": "^9.5.0",
-    "qrcode": "^1.5.4"
+    "pino": "^9.5.0"
   },
   "engines": {
     "node": ">=18.0.0"
