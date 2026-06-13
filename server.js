@@ -1,5 +1,5 @@
-// WhatsApp Bot Server for Render (persistent Node.js process)
-// Keeps Baileys WebSocket alive unlike serverless functions
+// WhatsApp Bot Server for Render - Persistent Node.js process
+// Keeps Baileys WebSocket alive (unlike serverless)
 const express = require('express');
 const cors = require('cors');
 const fs = require('fs');
@@ -14,19 +14,67 @@ const DATA_DIR = path.join(__dirname, 'data');
 const SESSION_DIR = path.join(DATA_DIR, 'session');
 fs.mkdirSync(SESSION_DIR, { recursive: true });
 
-// Baileys (dynamic ESM import)
-let baileysMod = null;
-async function getBaileys() {
-  if (!baileysMod) baileysMod = await import('@whiskeysockets/baileys');
-  return baileysMod;
-}
-
-// ============ In-memory state ============
+// ============ State ============
 let sock = null;
 let waConnected = false;
 let linkedPhone = null;
 let sessionId = null;
 let linkedAt = null;
+
+// ============ Baileys resolver ============
+// Baileys v6+ is ESM-only. We resolve exports carefully.
+let _makeWASocket = null;
+let _useMultiFileAuthState = null;
+let _fetchLatestBaileysVersion = null;
+let _Browsers = null;
+let _pino = null;
+
+async function loadBaileys() {
+  console.log('Loading Baileys module...');
+  const baileys = await import('@whiskeysockets/baileys');
+
+  // Log all available keys for debugging
+  const keys = Object.keys(baileys);
+  console.log('Baileys export keys:', keys.slice(0, 30).join(', '), '...');
+
+  // Resolve makeWASocket - try every possible location
+  _makeWASocket = baileys.default?.makeWASocket
+    || baileys.default?.default
+    || baileys.makeWASocket
+    || baileys.default;
+
+  if (typeof _makeWASocket !== 'function') {
+    // Last resort: search for the function
+    for (const key of keys) {
+      if (typeof baileys[key] === 'function' && key.toLowerCase().includes('socket')) {
+        _makeWASocket = baileys[key];
+        console.log('Found makeWASocket as:', key);
+        break;
+      }
+    }
+  }
+
+  _useMultiFileAuthState = baileys.useMultiFileAuthState || baileys.default?.useMultiFileAuthState;
+  _fetchLatestBaileysVersion = baileys.fetchLatestBaileysVersion || baileys.default?.fetchLatestBaileysVersion;
+  _Browsers = baileys.Browsers || baileys.default?.Browsers;
+
+  console.log('makeWASocket type:', typeof _makeWASocket);
+  console.log('useMultiFileAuthState type:', typeof _useMultiFileAuthState);
+
+  if (typeof _makeWASocket !== 'function') {
+    console.error('CRITICAL: makeWASocket is not a function!');
+    console.error('baileys.default type:', typeof baileys.default);
+    if (baileys.default) console.error('baileys.default keys:', Object.keys(baileys.default).slice(0, 20));
+    throw new Error('Cannot resolve makeWASocket from baileys exports');
+  }
+
+  // Load pino
+  const pinoMod = await import('pino');
+  _pino = typeof pinoMod.default === 'function' ? pinoMod.default : pinoMod;
+  console.log('pino type:', typeof _pino);
+
+  console.log('Baileys loaded successfully!');
+}
 
 // ============ Helpers ============
 function readJSON(file, def = null) {
@@ -52,7 +100,7 @@ function auth(req, res, next) {
   }
 }
 
-// GitHub backup (optional - requires GITHUB_TOKEN + GITHUB_REPO)
+// GitHub backup (optional)
 async function ghRead(file) {
   const token = process.env.GITHUB_TOKEN, repo = process.env.GITHUB_REPO;
   if (!token || !repo) return null;
@@ -83,32 +131,22 @@ async function saveToGitHub() {
 
 // ============ Socket Management ============
 async function createSocket(fresh = false) {
-  const b = await getBaileys();
-  // Handle different ESM export structures
-  const makeWASocket = b.default || b.makeWASocket;
-  const useMultiFileAuthState = b.useMultiFileAuthState;
-  const fetchLatestBaileysVersion = b.fetchLatestBaileysVersion;
-  const Browsers = b.Browsers;
+  if (!_makeWASocket) await loadBaileys();
 
-  if (!makeWASocket) {
-    console.error('Baileys exports:', Object.keys(b));
-    throw new Error('makeWASocket not found in baileys exports. Keys: ' + Object.keys(b).join(', '));
+  if (fresh) {
+    try { fs.rmSync(SESSION_DIR, { recursive: true, force: true }); } catch {}
+    fs.mkdirSync(SESSION_DIR, { recursive: true });
   }
 
-  const pinoMod = await import('pino');
-  const pino = pinoMod.default || pinoMod;
-
-  if (fresh) { try { fs.rmSync(SESSION_DIR, { recursive: true, force: true }); } catch {} fs.mkdirSync(SESSION_DIR, { recursive: true }); }
-
-  const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
+  const { state, saveCreds } = await _useMultiFileAuthState(SESSION_DIR);
   let version;
-  try { version = (await fetchLatestBaileysVersion()).version; } catch { version = [2, 3000, 1021221121]; }
+  try { version = (await _fetchLatestBaileysVersion()).version; } catch { version = [2, 3000, 1021221121]; }
 
-  sock = makeWASocket({
-    version, logger: pino({ level: 'silent' }), auth: state,
-    browser: (Browsers?.ubuntu) ? Browsers.ubuntu('ZAID BWP') : ['ZAID BWP', 'Chrome', '1.0.0'],
-    printQRInTerminal: false
-  });
+  const browser = (_Browsers?.ubuntu) ? _Browsers.ubuntu('ZAID BWP') : ['ZAID BWP', 'Chrome', '1.0.0'];
+  const logger = _pino({ level: 'silent' });
+
+  console.log('Creating WA socket, version:', version);
+  sock = _makeWASocket({ version, logger, auth: state, browser, printQRInTerminal: false });
 
   sock.ev.on('creds.update', saveCreds);
   sock.ev.on('connection.update', (update) => {
@@ -143,11 +181,15 @@ async function ensureConnected() {
     console.log('Restoring saved session...');
     await createSocket(false);
     await waitForConn(20000);
-  } else { throw new Error('WhatsApp not linked'); }
+  } else { throw new Error('WhatsApp not linked - pair from admin panel first'); }
 }
 
-// ============ Startup: restore session ============
+// ============ Startup ============
 (async () => {
+  // Load baileys module first
+  await loadBaileys();
+
+  // Restore session if exists
   const config = readJSON('config.json');
   if (config?.linked) {
     sessionId = config.sessionId; linkedPhone = config.phone; linkedAt = config.linkedAt;
@@ -164,7 +206,7 @@ app.get('/api/whatsapp', auth, (req, res) => {
   res.json({ linked: waConnected, phone: linkedPhone, sessionId, linkedAt });
 });
 
-// Pair (pairing code)
+// Pair
 app.post('/api/whatsapp', auth, async (req, res) => {
   if (req.query.action !== 'pair') return res.status(400).json({ error: 'Use ?action=pair' });
   const { phone } = req.body;
@@ -178,6 +220,7 @@ app.post('/api/whatsapp', auth, async (req, res) => {
     const code = await s.requestPairingCode(clean);
     const display = code.length === 8 ? code.slice(0, 4) + '-' + code.slice(4) : code;
     console.log('Pairing code:', display, 'for', clean);
+
     const result = await new Promise((resolve) => {
       let done = false;
       s.ev.on('connection.update', async (u) => {
@@ -187,10 +230,8 @@ app.post('/api/whatsapp', auth, async (req, res) => {
           linkedPhone = ph; sessionId = 'zaidashiq_' + crypto.randomBytes(8).toString('hex');
           linkedAt = new Date().toISOString(); waConnected = true;
           try { saveCreds(); } catch {}
-          // Save auth state for persistence
           try {
-            const authData = { creds: state.creds, keys: serializeKeys(state.keys), phone: ph, sessionId, linkedAt };
-            writeJSON('wa-auth-backup.json', authData);
+            writeJSON('wa-auth-backup.json', { creds: state.creds, keys: serializeKeys(state.keys), phone: ph, sessionId, linkedAt });
             await saveToGitHub();
           } catch {}
           // Send session ID to paired number
@@ -199,7 +240,8 @@ app.post('/api/whatsapp', auth, async (req, res) => {
               `╔═══════════════════════╗\n  🏢 *ZAID BWP MANAGEMENT*\n  📱 03299931199\n╚═══════════════════════╝\n\n` +
               `✅ *WhatsApp Successfully Linked!*\n\n🔑 *Session ID:*\n\`${sessionId}\`\n\n` +
               `━━━━━━━━━━━━━━━━━━\n📋 *Setup:*\n` +
-              `Add this as env variable:\n  Name: \`WA_SESSION_ID\`\n  Value: \`${sessionId}\`\n\n` +
+              `Add env variable on Render:\n  Name: \`WA_SESSION_ID\`\n  Value: \`${sessionId}\`\n\n` +
+              `Also add on Vercel:\n  Name: \`WA_SESSION_ID\`\n  Value: \`${sessionId}\`\n\n` +
               `━━━━━━━━━━━━━━━━━━\n📌 _Powered by ZAID BWP_\n📞 _03299931199_`
             });
             console.log('Session ID sent to', ph);
@@ -209,7 +251,7 @@ app.post('/api/whatsapp', auth, async (req, res) => {
         }
         if (u.connection === 'close' && !done) { done = true; resolve({ status: 'error', message: 'Connection closed. Try again.' }); }
       });
-      setTimeout(() => { if (!done) { done = true; resolve({ status: 'timeout', message: 'Timed out (55s). Code not entered.' }); } }, 55000);
+      setTimeout(() => { if (!done) { done = true; resolve({ status: 'timeout', message: 'Timed out (55s). Code not entered in WhatsApp.' }); } }, 55000);
     });
     return res.json({ ...result, pairingCode: display });
   } catch (err) {
@@ -218,16 +260,15 @@ app.post('/api/whatsapp', auth, async (req, res) => {
   }
 });
 
-// Send message
+// Send
 app.post('/api/whatsapp-send', async (req, res) => {
   try {
-    // Session ID validation
     const envSid = process.env.WA_SESSION_ID;
     if (envSid && envSid !== sessionId) {
       return res.json({ success: false, error: 'Session ID mismatch - update WA_SESSION_ID env var' });
     }
     const { section, entry, command, senderJid, text: directText, document } = req.body;
-    if (!sock || !waConnected) { await ensureConnected(); }
+    if (!sock || !waConnected) await ensureConnected();
     if (command) return await handleCommand(command, senderJid, res);
     if (directText || document) {
       const to = (req.body.to || req.query.to || '') + '@s.whatsapp.net';
@@ -279,7 +320,7 @@ app.post('/api/whatsapp-webhook', async (req, res) => {
 });
 
 // Health
-app.get('/health', (req, res) => res.json({ status: 'ok', connected: waConnected, phone: linkedPhone, uptime: process.uptime() }));
+app.get('/health', (req, res) => res.json({ status: 'ok', connected: waConnected, phone: linkedPhone, uptime: Math.round(process.uptime()), baileysLoaded: !!_makeWASocket }));
 
 // ============ Command Handler ============
 async function handleCommand(command, senderJid, res) {
@@ -294,7 +335,6 @@ async function handleCommand(command, senderJid, res) {
       await sock.sendMessage(targetJid, { text: header + '❌ Unknown command.\n\nAvailable:\n• itemsms/itemspic\n• walletms/walletpic\n• personms/personpic\n• maintenancems/maintenancepic\n• samplesms/samplespic\n• clippingms/clippingpic' });
       return res.json({ success: true });
     }
-    // Fetch data from GitHub
     let entries = [];
     const token = process.env.GITHUB_TOKEN, repo = process.env.GITHUB_REPO;
     if (token && repo) {
@@ -348,7 +388,6 @@ function formatMsg(section, entry) {
   return `${header}\n\n${d}\n\n━━━━━━━━━━━━━━━━━━\n⏰ *${time}*\n📌 _Powered by ZAID BWP_\n📞 _03299931199_`;
 }
 
-// ============ Helpers ============
 function serializeKeys(keys) {
   const r = {};
   for (const [k, v] of Object.entries(keys)) { if (v && typeof v === 'object') r[k] = v; }
@@ -357,4 +396,4 @@ function serializeKeys(keys) {
 
 // ============ Start ============
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`WhatsApp Bot running on port ${PORT}`));
+app.listen(PORT, () => console.log(`WhatsApp Bot server listening on port ${PORT}`));
