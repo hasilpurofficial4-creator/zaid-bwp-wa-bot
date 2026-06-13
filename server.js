@@ -97,23 +97,32 @@ async function createSocket(fresh = false) {
 
   const { state, saveCreds } = await _useMultiFileAuthState(SESSION_DIR);
   let version;
-  try { version = (await _fetchLatestBaileysVersion()).version; } catch { version = [2, 3000, 1021221121]; }
+  try {
+    const vl = await _fetchLatestBaileysVersion();
+    version = vl.version;
+    console.log('[SOCK] Latest baileys version:', version, 'isLatest:', vl.isLatest);
+  } catch (e) {
+    version = [2, 3000, 1021221121];
+    console.log('[SOCK] Version fetch failed, using fallback:', version, 'error:', e.message);
+  }
   const browser = (_Browsers?.ubuntu) ? _Browsers.ubuntu('ZAID BWP') : ['ZAID BWP', 'Chrome', '1.0.0'];
 
   console.log('[SOCK] Creating socket, version:', version);
-  sock = _makeWASocket({ version, logger: _pino({ level: 'silent' }), auth: state, browser, printQRInTerminal: false });
+  // Use 'warn' level so we see Baileys internal errors
+  const logger = _pino({ level: process.env.BAILEYS_LOG || 'warn' });
+  sock = _makeWASocket({ version, logger, auth: state, browser, printQRInTerminal: false, generateHighQualityLinkPreview: false });
 
   sock.ev.on('creds.update', saveCreds);
   sock.ev.on('connection.update', (update) => {
-    const { connection, lastDisconnect } = update;
+    const { connection, lastDisconnect, receivedPendingNotifications, isOnline } = update;
+    console.log('[SOCK] update:', JSON.stringify({ connection, isOnline, receivedPendingNotifications, lastDisconnect: lastDisconnect ? { statusCode: lastDisconnect.error?.output?.statusCode, msg: lastDisconnect.error?.message } : null }));
 
     if (connection === 'open') {
       waConnected = true;
       linkedPhone = sock.user?.id?.split(':')[0] || linkedPhone;
-      console.log('[SOCK] Connected:', linkedPhone);
+      console.log('[SOCK] ✅ Connected:', linkedPhone);
       if (!linkedAt) linkedAt = new Date().toISOString();
       writeJSON('config.json', { linked: true, phone: linkedPhone, sessionId, linkedAt });
-      // Notify pairing listeners
       pairingListeners.forEach(fn => fn({ type: 'open' }));
     }
 
@@ -121,8 +130,7 @@ async function createSocket(fresh = false) {
       waConnected = false;
       const err = lastDisconnect?.error;
       const sc = err?.output?.statusCode || err?.data?.statusCode || 0;
-      console.log('[SOCK] Disconnected, status:', sc, 'msg:', err?.message || 'unknown');
-      // Notify pairing listeners
+      console.log('[SOCK] ❌ Closed, status:', sc, 'msg:', err?.message || 'unknown', 'stack:', err?.stack?.split('\n').slice(0,3).join(' | '));
       pairingListeners.forEach(fn => fn({ type: 'close', statusCode: sc, error: err?.message }));
       // Auto-reconnect if not auth failure
       if (sc !== 401 && sc !== 403 && fs.existsSync(path.join(SESSION_DIR, 'creds.json'))) {
