@@ -289,8 +289,21 @@ app.post('/api/pair', async (req, res) => {
     pairingListeners = [];
     const { sock: s, state, saveCreds } = await createSocket(true);
 
-    // Small delay for socket to stabilize
-    await new Promise(r => setTimeout(r, 2000));
+    // Wait for socket connection to open
+    console.log('[PAIR] Waiting for socket connection...');
+    await new Promise((resolve, reject) => {
+      const t = setTimeout(() => reject(new Error('Socket connection timeout (20s)')), 20000);
+      const handler = (u) => {
+        if (u.connection === 'open') { clearTimeout(t); resolve(); }
+        if (u.connection === 'close') {
+          const sc = u.lastDisconnect?.error?.output?.statusCode || 0;
+          console.log('[PAIR] Socket closed during connect, status:', sc);
+          if (sc === 401 || sc === 403) { clearTimeout(t); reject(new Error('Auth failed: ' + (u.lastDisconnect?.error?.message || sc))); }
+        }
+      };
+      s.ev.on('connection.update', handler);
+    });
+    console.log('[PAIR] Socket connected, requesting pairing code...');
 
     const code = await s.requestPairingCode(clean);
     const display = code.length === 8 ? code.slice(0, 4) + '-' + code.slice(4) : code;
