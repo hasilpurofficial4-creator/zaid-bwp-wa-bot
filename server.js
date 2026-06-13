@@ -297,23 +297,24 @@ app.post('/api/pair', async (req, res) => {
     pairingListeners = [];
     const { sock: s, state, saveCreds } = await createSocket(true);
 
-    // Wait for socket connection to open
-    console.log('[PAIR] Waiting for socket connection...');
-    await new Promise((resolve, reject) => {
-      const t = setTimeout(() => reject(new Error('Socket connection timeout (20s)')), 20000);
-      const handler = (u) => {
-        if (u.connection === 'open') { clearTimeout(t); resolve(); }
-        if (u.connection === 'close') {
-          const sc = u.lastDisconnect?.error?.output?.statusCode || 0;
-          console.log('[PAIR] Socket closed during connect, status:', sc);
-          if (sc === 401 || sc === 403) { clearTimeout(t); reject(new Error('Auth failed: ' + (u.lastDisconnect?.error?.message || sc))); }
-        }
-      };
-      s.ev.on('connection.update', handler);
-    });
-    console.log('[PAIR] Socket connected, requesting pairing code...');
+    // For fresh sockets, 'open' only fires AFTER pairing.
+    // We need to request pairing code right away (after brief WS setup).
+    console.log('[PAIR] Fresh socket created, waiting 3s for WS to stabilize...');
+    await new Promise(r => setTimeout(r, 3000));
 
-    const code = await s.requestPairingCode(clean);
+    // Request pairing code with retry (Render may be slow)
+    let code;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        console.log(`[PAIR] Requesting pairing code (attempt ${attempt})...`);
+        code = await s.requestPairingCode(clean);
+        break;
+      } catch (e) {
+        console.log(`[PAIR] Pairing code attempt ${attempt} failed:`, e.message);
+        if (attempt === 3) throw e;
+        await new Promise(r => setTimeout(r, 3000));
+      }
+    }
     const display = code.length === 8 ? code.slice(0, 4) + '-' + code.slice(4) : code;
     console.log('[PAIR] Code:', display, 'for', clean);
 
