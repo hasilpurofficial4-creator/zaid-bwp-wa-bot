@@ -24,38 +24,16 @@ let pairingListeners = [];
 let autoReconnect = true; // flag to control auto-reconnect
 let socketId = 0; // track socket instances to prevent stale listeners
 
-// ==================== BAILEYS LOADER ====================
-let _makeWASocket, _useMultiFileAuthState, _fetchLatestBaileysVersion, _Browsers, _pino;
+// ==================== BAILEYS (CJS - no ESM issues) ====================
+const baileys = require('./baileys');
+const { makeWASocket, useMultiFileAuthState, Browsers, fetchLatestBaileysVersion } = baileys;
+const pino = require('pino');
 
-async function loadBaileys() {
-  if (_makeWASocket) return;
-  console.log('[INIT] Loading Baileys...');
-  const b = await import('@whiskeysockets/baileys');
-  const keys = Object.keys(b);
-  console.log('[INIT] Baileys exports:', keys.slice(0, 25).join(', '), '...');
-
-  _makeWASocket = b.default?.makeWASocket || b.default?.default || b.makeWASocket || b.default;
-  _useMultiFileAuthState = b.useMultiFileAuthState || b.default?.useMultiFileAuthState;
-  _fetchLatestBaileysVersion = b.fetchLatestBaileysVersion || b.default?.fetchLatestBaileysVersion;
-  _Browsers = b.Browsers || b.default?.Browsers;
-
-  if (typeof _makeWASocket !== 'function') {
-    for (const k of keys) {
-      if (typeof b[k] === 'function' && k.toLowerCase().includes('socket')) {
-        _makeWASocket = b[k]; console.log('[INIT] Found makeWASocket as:', k); break;
-      }
-    }
-  }
-  if (typeof _makeWASocket !== 'function') {
-    console.error('[INIT] FAIL - makeWASocket not found. Keys:', keys.join(', '));
-    console.error('[INIT] b.default type:', typeof b.default, b.default ? Object.keys(b.default).slice(0, 15) : 'null');
-    process.exit(1);
-  }
-
-  const pm = await import('pino');
-  _pino = typeof pm.default === 'function' ? pm.default : pm;
-  console.log('[INIT] Baileys loaded OK. makeWASocket:', typeof _makeWASocket, '| useMultiFileAuthState:', typeof _useMultiFileAuthState);
-}
+console.log('[INIT] Baileys loaded (CJS)');
+console.log('[INIT] makeWASocket:', typeof makeWASocket);
+console.log('[INIT] useMultiFileAuthState:', typeof useMultiFileAuthState);
+console.log('[INIT] Browsers:', typeof Browsers);
+console.log('[INIT] fetchLatestBaileysVersion:', typeof fetchLatestBaileysVersion);
 
 // ==================== HELPERS ====================
 function readJSON(f, d = null) { try { return JSON.parse(fs.readFileSync(path.join(DATA_DIR, f), 'utf-8')); } catch { return d; } }
@@ -94,25 +72,24 @@ async function saveToGitHub() {
 
 // ==================== SOCKET ====================
 async function createSocket(fresh = false) {
-  if (!_makeWASocket) await loadBaileys();
   if (fresh) { try { fs.rmSync(SESSION_DIR, { recursive: true, force: true }); } catch {} fs.mkdirSync(SESSION_DIR, { recursive: true }); }
 
-  const { state, saveCreds } = await _useMultiFileAuthState(SESSION_DIR);
+  const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
   let version;
   try {
-    const vl = await _fetchLatestBaileysVersion();
+    const vl = await fetchLatestBaileysVersion();
     version = vl.version;
     console.log('[SOCK] Latest baileys version:', version);
   } catch (e) {
     version = [2, 3000, 1021221121];
     console.log('[SOCK] Version fetch failed, using fallback');
   }
-  const browser = (_Browsers?.ubuntu) ? _Browsers.ubuntu('ZAID BWP') : ['ZAID BWP', 'Chrome', '1.0.0'];
+  const browser = (Browsers?.ubuntu) ? Browsers.ubuntu('ZAID BWP') : ['ZAID BWP', 'Chrome', '1.0.0'];
   const myId = ++socketId;
 
   console.log(`[SOCK#${myId}] Creating socket, version:`, version);
-  const logger = _pino({ level: process.env.BAILEYS_LOG || 'warn' });
-  const newSock = _makeWASocket({ version, logger, auth: state, browser, printQRInTerminal: false, generateHighQualityLinkPreview: false });
+  const logger = pino({ level: process.env.BAILEYS_LOG || 'warn' });
+  const newSock = makeWASocket({ version, logger, auth: state, browser, printQRInTerminal: false, generateHighQualityLinkPreview: false });
   sock = newSock;
 
   newSock.ev.on('creds.update', saveCreds);
@@ -441,7 +418,7 @@ app.get('/api/whatsapp', auth, (req, res) => {
 });
 
 // Health
-app.get('/health', (req, res) => res.json({ status: 'ok', connected: waConnected, phone: linkedPhone, uptime: Math.round(process.uptime()), baileys: !!_makeWASocket }));
+app.get('/health', (req, res) => res.json({ status: 'ok', connected: waConnected, phone: linkedPhone, uptime: Math.round(process.uptime()), baileys: true }));
 
 // ==================== COMMAND HANDLER ====================
 async function handleCommand(command, senderJid, res) {
@@ -495,7 +472,6 @@ function serializeKeys(keys) { const r = {}; for (const [k,v] of Object.entries(
 
 // ==================== START ====================
 (async () => {
-  await loadBaileys();
   const config = readJSON('config.json');
   if (config?.linked) {
     sessionId = config.sessionId; linkedPhone = config.phone; linkedAt = config.linkedAt;
